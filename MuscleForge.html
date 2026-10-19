@@ -72,7 +72,124 @@ const KEY='muscleforge_v1';const exercises=[
 {day:'Saturday',title:'Legs C',focus:'Quads / Hamstrings / Calves / Core',items:[['Goblet squat',3,'10–15','Dumbbell'],['Barbell Romanian deadlift',3,'8–12','Barbell'],['Leg curl (only if attachment supports it)',2,'10–15','Leg developer'],['Leg extension',2,'12–15','Leg developer'],['Standing calf raise',3,'12–20','Bodyweight / Dumbbell'],['Plank',2,'30–60 seconds','Bodyweight']]}
 ]
 const defaultData=()=>({start:new Date().toLocaleDateString('en-CA'),calories:2600,protein:120,goalGain:.375,logs:{},weights:[],nutrition:[],recovery:[],notes:{}});
-let db;try{db=JSON.parse(localStorage.getItem(KEY))||defaultData()}catch(e){db=defaultData()};db={...defaultData(),...db};let page='dashboard',day=0,logDate=new Date().toLocaleDateString('en-CA');const $=id=>document.getElementById(id),safe=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(db))}catch(e){alert('Storage unavailable. Export a backup before closing.')}};const num=x=>Number.isFinite(+x)?+x:0;const dayDiff=(a,b)=>Math.floor((new Date(b+'T12:00:00')-new Date(a+'T12:00:00'))/86400000);const week=()=>Math.max(1,Math.min(12,Math.floor(dayDiff(db.start,new Date().toLocaleDateString('en-CA'))/7)+1));const logKey=(d,i)=>d+'|'+i;const title=(a,b)=>`<h1>${a}</h1><p class="sub">${b}</p>`;const recent=(a)=>a.slice().sort((x,y)=>y.date.localeCompare(x.date));const nfmt=x=>Number.isFinite(x)?x.toFixed(1):'—';const getLog=(date,d,i,s)=>db.logs[date+'|'+d+'|'+i+'|'+s]||{};
+
+// Durable data layer: localStorage for speed + IndexedDB as a second, origin-local recovery copy.
+// The legacy v1 key is kept for backwards compatibility. App updates on the same URL do not erase either store.
+const LEGACY_KEY='muscleforge_v1';
+const DATA_KEY='muscleforge_v2';
+const IDB_NAME='MuscleForgeData';
+const IDB_STORE='snapshots';
+let db;
+let storageState={revision:0,savedAt:0};
+function normalizeData(x){
+  const base=defaultData();
+  const out={...base,...(x&&typeof x==='object'?x:{})};
+  out.logs=out.logs&&typeof out.logs==='object'?out.logs:{};
+  out.weights=Array.isArray(out.weights)?out.weights:[];
+  out.nutrition=Array.isArray(out.nutrition)?out.nutrition:[];
+  out.recovery=Array.isArray(out.recovery)?out.recovery:[];
+  out.notes=out.notes&&typeof out.notes==='object'?out.notes:{};
+  return out;
+}
+function dataHasContent(x){return !!x&&(Object.keys(x.logs||{}).length>0||(x.weights||[]).length>0||(x.nutrition||[]).length>0||(x.recovery||[]).length>0||Object.keys(x.notes||{}).length>0);}
+function parseStored(raw){try{if(!raw)return null;const x=JSON.parse(raw);return x&&typeof x==='object'?x:null}catch(e){return null}}
+function loadLocalData(){
+  const v2=parseStored(localStorage.getItem(DATA_KEY));
+  const v1=parseStored(localStorage.getItem(LEGACY_KEY));
+  // Prefer v2, but if it is empty and legacy has real data, migrate the legacy data forward.
+  if(v2){storageState={revision:Number(v2.__mfRevision)||0,savedAt:Number(v2.__mfSavedAt)||0};return normalizeData(v2.data||v2)}
+  if(v1){const migrated=normalizeData(v1);storageState={revision:Number(v1.__mfRevision)||0,savedAt:Number(v1.__mfSavedAt)||0};return migrated}
+  return defaultData();
+}
+db=loadLocalData();
+let page='dashboard',day=0,logDate=new Date().toLocaleDateString('en-CA');
+const $=id=>document.getElementById(id),safe=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num=x=>Number.isFinite(+x)?+x:0;
+const dayDiff=(a,b)=>Math.floor((new Date(b+'T12:00:00')-new Date(a+'T12:00:00'))/86400000);
+const week=()=>Math.max(1,Math.min(12,Math.floor(dayDiff(db.start,new Date().toLocaleDateString('en-CA'))/7)+1));
+const logKey=(d,i)=>d+'|'+i;
+const title=(a,b)=>`<h1>${a}</h1><p class="sub">${b}</p>`;
+const recent=(a)=>a.slice().sort((x,y)=>y.date.localeCompare(x.date));
+const nfmt=x=>Number.isFinite(x)?x.toFixed(1):'—';
+const getLog=(date,d,i,s)=>db.logs[date+'|'+d+'|'+i+'|'+s]||{};
+
+let mfDbPromise=null,mfSaveChain=Promise.resolve();
+function openMfDb(){
+  if(mfDbPromise)return mfDbPromise;
+  mfDbPromise=new Promise((resolve,reject)=>{
+    if(!('indexedDB' in window))return reject(new Error('IndexedDB unavailable'));
+    const req=indexedDB.open(IDB_NAME,1);
+    req.onupgradeneeded=()=>{const d=req.result;if(!d.objectStoreNames.contains(IDB_STORE))d.createObjectStore(IDB_STORE)};
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error||new Error('IndexedDB open failed'));
+  });
+  return mfDbPromise;
+}
+function idbPutSnapshot(payload){
+  return openMfDb().then(d=>new Promise((resolve,reject)=>{
+    const tx=d.transaction(IDB_STORE,'readwrite'),store=tx.objectStore(IDB_STORE);
+    store.put(payload,'current');
+    tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error||new Error('IndexedDB write failed'));
+  }));
+}
+function idbGetSnapshot(){
+  return openMfDb().then(d=>new Promise((resolve,reject)=>{
+    const tx=d.transaction(IDB_STORE,'readonly'),req=tx.objectStore(IDB_STORE).get('current');
+    req.onsuccess=()=>resolve(req.result||null);req.onerror=()=>reject(req.error||new Error('IndexedDB read failed'));
+  }));
+}
+function persistDurably(){
+  const snapshot={data:db,__mfRevision:storageState.revision,__mfSavedAt:storageState.savedAt};
+  // Keep localStorage and IndexedDB serialized in the same order so rapid set logging cannot race.
+  mfSaveChain=mfSaveChain.then(()=>idbPutSnapshot(snapshot)).catch(()=>{});
+}
+const save=()=>{
+  try{
+    storageState.revision=(storageState.revision||0)+1;
+    storageState.savedAt=Date.now();
+    const payload=JSON.stringify({data:db,__mfRevision:storageState.revision,__mfSavedAt:storageState.savedAt});
+    localStorage.setItem(DATA_KEY,payload);
+    // Also maintain the legacy key so older MuscleForge builds can still read the latest data.
+    localStorage.setItem(LEGACY_KEY,JSON.stringify({...db,__mfRevision:storageState.revision,__mfSavedAt:storageState.savedAt}));
+    // Verify immediately; a quota/security failure must never be silent.
+    if(localStorage.getItem(DATA_KEY)!==payload)throw new Error('Local save verification failed');
+    persistDurably();
+    return true;
+  }catch(e){
+    alert('MuscleForge could not verify this save. Your workout is still in the current page. Open Settings → Back up your workout data before leaving this page.');
+    return false;
+  }
+};
+async function recoverFromIndexedDb(){
+  try{
+    const snap=await idbGetSnapshot();
+    if(!snap||!snap.data){
+      persistDurably();
+      return;
+    }
+    const diskRev=Number(snap.__mfRevision)||0,diskTime=Number(snap.__mfSavedAt)||0;
+    const localContent=dataHasContent(db);
+    // Never replace a newer local database. Restore only when the durable copy is newer or local storage is empty.
+    if(!localContent || diskRev>storageState.revision || diskTime>storageState.savedAt){
+      db=normalizeData(snap.data);storageState={revision:diskRev,savedAt:diskTime};
+      try{
+        const payload=JSON.stringify({data:db,__mfRevision:diskRev,__mfSavedAt:diskTime});
+        localStorage.setItem(DATA_KEY,payload);
+        localStorage.setItem(LEGACY_KEY,JSON.stringify({...db,__mfRevision:diskRev,__mfSavedAt:diskTime}));
+      }catch(e){}
+      render();
+      mfToast('Recovered your saved MuscleForge data');
+    }
+    // Keep the recovery copy synchronized with whichever database won the comparison.
+    persistDurably();
+  }catch(e){}
+}
+// Check the recovery copy after the initial render; this protects against a bad/empty localStorage read after an update.
+recoverFromIndexedDb();
+if(navigator.storage?.persist)navigator.storage.persist().catch(()=>{});
+window.addEventListener('pagehide',()=>{try{save()}catch(e){}});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){try{save()}catch(e){}}});
+
 function nav(p){page=p;document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('active',n.dataset.page===p));document.querySelectorAll('[data-mobile-page]').forEach(n=>n.classList.toggle('active',n.dataset.mobilePage===p));document.getElementById('mobileMore')?.classList.remove('open');document.getElementById('moreToggle')?.setAttribute('aria-expanded','false');render();window.scrollTo({top:0,behavior:'instant'})};document.querySelectorAll('.nav').forEach(n=>n.onclick=()=>nav(n.dataset.page));document.querySelectorAll('[data-mobile-page]').forEach(n=>n.addEventListener('click',()=>nav(n.dataset.mobilePage)));document.getElementById('moreToggle').addEventListener('click',()=>{let el=document.getElementById('mobileMore');el.classList.add('open');document.getElementById('moreToggle').setAttribute('aria-expanded','true')});document.getElementById('moreClose').addEventListener('click',()=>document.getElementById('mobileMore').classList.remove('open'));document.getElementById('mobileMore').addEventListener('click',e=>{if(e.target.id==='mobileMore')e.currentTarget.classList.remove('open')});function render(){({dashboard,workouts,body,nutrition,recovery,history,settings,analytics,calendar,measurements,library,builder})[page]();}
 function dashboard(){const done=Object.values(db.logs).filter(x=>x.done).length;const w=recent(db.weights),last=w[0];const thisWeek=Object.keys(db.logs).filter(k=>{let x=db.logs[k];return x.done&&dayDiff(k.slice(0,10),new Date().toLocaleDateString('en-CA'))>=0&&dayDiff(k.slice(0,10),new Date().toLocaleDateString('en-CA'))<7}).length;const n=recent(db.nutrition)[0];$('main').innerHTML=title('Your Muscle Growth Dashboard','A complete offline tracker for your home gym and 12-week upper-body-focused program')+`<div class="cards"><div class="card"><div class="label">Program week</div><div class="stat">${week()} / 12</div><div class="progress"><div style="width:${week()/12*100}%"></div></div></div><div class="card"><div class="label">Last weigh-in</div><div class="stat">${last?safe(last.weight)+' lb':'—'}</div><div class="muted tiny">Target: +0.25–0.5 lb/week</div></div><div class="card"><div class="label">Sets completed</div><div class="stat">${done}</div><div class="muted tiny">All-time logged sets</div></div><div class="card"><div class="label">Recent nutrition</div><div class="stat">${n?safe(n.calories):'—'} <span class="tiny">kcal</span></div><div class="muted tiny">Protein: ${n?safe(n.protein):'—'} g</div></div></div><div class="grid2"><div class="card"><h2>Today's focus</h2><p class="muted">${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][new Date().getDay()]==='Sunday'?'Rest day':safe(exercises.find(x=>x.day===['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][new Date().getDay()])?.title||'Training')}</p><p>Keep 2–3 reps in reserve on most sets. Progress by adding reps, then weight, while maintaining form.</p><button class="btn" onclick="nav('workouts')">Open workout tracker →</button></div><div class="card"><h2>Daily targets</h2><p><b>${safe(db.calories)} kcal</b> · <b>${safe(db.protein)} g protein</b> · 7–9 hours sleep</p><p class="muted">Aim for slow, consistent body-weight gain and review weekly averages.</p><button class="btn alt" onclick="nav('nutrition')">Log food totals</button></div></div><div class="notice">Weekly structure: alternate Upper and Legs for six training days. Upper days combine both pushing and pulling so every upper session trains the whole upper body. Keep most sets at 2–3 reps in reserve and take Sunday as your full rest day. Heavy barbell bench pressing without safety catches or a spotter is excluded.</div><div class="card"><h2>12-week plan</h2><p><b>Weeks 1–2:</b> Learn technique and use conservative loads, stopping most sets with 2–3 reps in reserve.</p><p><b>Weeks 3–4:</b> Build toward the listed set volume while keeping form strict.</p><p><b>Weeks 5–12:</b> Progress repetitions and load. If recovery drops, use an extra rest day rather than forcing six sessions.</p></div>`}
 // Links are exercise-specific searches, not unverified claims about individual videos.
